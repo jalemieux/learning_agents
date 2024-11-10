@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def user_interface(text):
     logger.info(f"user_interface: {text}")
-    user_input = input(text + "\n")
+    user_input = input(f"\033[1m{text}\033[0m\n")
     logger.info(f"user_input: {user_input}")
     return user_input
     

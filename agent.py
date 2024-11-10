@@ -2,9 +2,15 @@ from dataclasses import Field
 import json
 import logging
 import sqlite3
+import subprocess
+import sys
 from typing import Dict
 import uuid
 from openai import OpenAI
+import tempfile
+import os
+import shutil
+import re
 
 exit_tool = {
     "type": "function",
@@ -53,7 +59,7 @@ python_interpreter_tool = {
     "function": {
         "name": "execute_code",
         "strict": True,
-        "description": "Execute python script and return the output.",
+        "description": "Execute python script and return the standard output.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -68,40 +74,6 @@ python_interpreter_tool = {
     }
 }
 
-# Function to run generated Python code in a separate interpreter
-def execute_code_old(code):
-    local_vars = {}
-    try:
-        import io
-        import sys
-
-        # Redirect stdout to capture print statements
-        old_stdout = sys.stdout
-        new_stdout = io.StringIO()
-        sys.stdout = new_stdout
-
-        try:
-            exec(code, {}, local_vars)
-            output = new_stdout.getvalue()
-            return output if output else local_vars.get("result", "No result variable found")
-        except Exception as e:
-            return f"Error: {e}"
-        finally:
-            # Reset stdout
-            sys.stdout = old_stdout
-    except Exception as e:
-        return f"Error: {e}"
-    
-def execute_code(code):
-    import io
-    import contextlib
-    # Create a StringIO object to capture the output
-    output = io.StringIO()
-    # Redirect standard output to the StringIO object
-    with contextlib.redirect_stdout(output):
-        exec(code)
-    # Retrieve the script output as a string
-    return output.getvalue()
 
 class Agent:
     def __init__(self, prompt: str, instance_id=None, tools: list[dict] = []):
@@ -232,15 +204,74 @@ Consider the following tools:
 class Coder(Agent):
 
     def __init__(self, prompt: str =None, instance_id=None):
-        prompt = ("You are an AI capable of generating and running Python code to solve user questions. "
-                "Use a chain-of-thought approach to produce code step-by-step, analyzing results after each execution."
-                "When you believe you have a working solution, execute the code to verify it."
-                "If further refinement is needed, continue improving the code until the solution is accurate."
-                "Once you confirm the output is correct, call the appropriate tool"
-                "Ensure the output of the script answers the user's question."
-                "Only return Python code snippets for execution throughout the process, focusing on producing a correct and complete solution."
-                )
+        # prompt = ("You are an AI capable of generating and running Python code to solve user questions. "
+        #         "Use a chain-of-thought approach to produce code step-by-step, analyzing results after each execution."
+        #         "When you believe you have a working solution, execute the code using the appropriate tool."
+        #         "If further refinement is needed, continue improving the code until the solution is accurate."
+        #         "Ensure the output of the script answers the user's question."
+        #         "Only return Python code snippets for execution throughout the process, focusing on producing a correct and complete solution."
+        #         "Your python code snippets should print out the solution on stadard output."
+        #         )
+        prompt = """
+        You are an AI capable of generating and running Python code to solve user questions. 
+        Follow a chain-of-thought approach to break down the solution into logical steps, producing Python code incrementally.
+        For each step, execute the code using the appropriate tool, analyze the resulting output, and refine the code as needed.
+        1.	Begin by crafting a Python script based on the user’s question.
+        2.	Run the script and analyze the output returned by the tool, assessing whether it meets the user’s requirements.
+        3.	If the output is unsatisfactory, identify areas for improvement, adjust the script, and execute it again.
+        4.	Repeat this iterative process, refining the code and re-running it as necessary, until the final output fully addresses the user’s question.
+
+        Return only the Python code snippets intended for execution. Ensure that the final script prints the solution clearly on standard output, 
+        fulfilling all requirements accurately and completely.
+        """
         super().__init__(prompt=prompt, instance_id=instance_id, tools=[python_interpreter_tool])
+        self.execution_dir = tempfile.mkdtemp(dir=os.path.dirname(os.path.abspath(__file__)))
+        
+        # Set up a virtual environment in the execution directory
+        subprocess.run([sys.executable, "-m", "venv", self.execution_dir])
+
+    def __del__(self):
+        # Clean up the temporary directory when the object is destroyed
+        if os.path.exists(self.execution_dir):
+            shutil.rmtree(self.execution_dir)
+
+    def execute_code(self, code):
+        import subprocess
+        import sys
+        import os
+        import re
+
+        try:
+            # Create a temporary file to store the code in the execution directory
+            code_file_path = os.path.join(self.execution_dir, "script.py")
+            with open(code_file_path, "w") as code_file:
+                code_file.write(code)
+
+            # Extract import statements to determine required packages
+            imports = re.findall(r'^\s*import (\S+)|^\s*from (\S+) import', code, re.MULTILINE)
+            packages = {imp[0] or imp[1] for imp in imports}
+
+            # Activate the virtual environment and install packages
+            pip_executable = os.path.join(self.execution_dir, 'bin', 'pip') if os.name != 'nt' else os.path.join(self.execution_dir, 'Scripts', 'pip.exe')
+            for package in packages:
+                subprocess.run([pip_executable, "install", package], check=True)
+
+            # Run the code in a subprocess with the virtual environment
+            python_executable = os.path.join(self.execution_dir, 'bin', 'python') if os.name != 'nt' else os.path.join(self.execution_dir, 'Scripts', 'python.exe')
+            result = subprocess.run(
+                [python_executable, code_file_path],
+                capture_output=True,
+                text=True,
+                cwd=self.execution_dir
+            )
+
+            # Return the output or error
+            if result.returncode == 0:
+                return result.stdout
+            else:
+                return f"Error: {result.stderr}"
+        except Exception as e:
+            return f"Error: {e}"
 
     def run(self, input = str, context: dict = None) -> tuple[str, str]:
         self.add_message_to_history("user", input)
@@ -265,10 +296,12 @@ class Coder(Agent):
                         # arguments: "{\"code\":\"def fibonacci(n):\\n    a, b = 0, 1\\n    for _ in range(n):\\n        a, b = b, a + b\\n    return a\\n\\n# Get the 145th Fibonacci number\\nfibonacci_145 = fibonacci(145)\\nfibonacci_145\"}"
                         args = json.loads(tool_call.function.arguments)
                         self.logger.info(f"executing code: {args['code']}")
-                        execution_output = execute_code(args['code'])
+                        execution_output = self.execute_code(args['code'])
                         if execution_output.strip() == "":
-                            execution_output = "no output was produced!"
-                        self.add_message_to_history("user", f"Output of the code was: {execution_output}")
+                            output = "No standard output was produced. We expect the code to produce a result."
+                        else:
+                            output = f" {execution_output}"
+                        self.add_message_to_history("user", execution_output)
 
 class Converser(Agent):
     def __init__(self, user_interface, prompt: str =None, instance_id=None):
